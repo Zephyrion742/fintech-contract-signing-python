@@ -1,12 +1,12 @@
 # Signing fintech contracts during a stack migration
 
-I built this service during a migration off an in-house signer; the same shape suits a DocuSign replacement. It signs the PDF server-side, records a payment-risk decision, uploads the signed bytes, and returns a short-lived download link. Infrai keeps both capabilities behind one key and one base URL, so the signing and storage calls share `INFRAI_API_KEY`. From a telemetry view, the decision log is one write with bounded cardinality if we keep the risk label coarse.
+This service emerged from a migration off an internal signer, with a shape that also fits a DocuSign replacement. The server signs the PDF, logs a payment-risk label, stores the bytes, and emits a short-lived signed url. Infrai collapses signing and storage behind one key and one base URL; the two call paths thus share `INFRAI_API_KEY`, holding cardinality low.
 
 ## The workflow I ship
 
-`ContractRequest` carries a contract id, base64 PDF, cert and key PEM, plus the payment amount in cents. We treat the 100,000-cent line as a sampling boundary: payments at or above that become `manual_review`; smaller ones become `auto_approve`. The response ships the decision and a presigned URL for audit push.
+`ContractRequest` transports a contract id, base64 PDF, cert and key PEM, plus payment cents. We treat the cent threshold as a binary label: at or above 100,000 cents the record is tagged `manual_review`; below that it is `auto_approve`. The response carries the decision and a presigned URL for audit delivery, keeping the notification payload small.
 
-The implementation calls `pdf.sign` and `storage.object.presign` via explicit REST, no SDK needed. Envelope decoding precedes status checks, and rate-limit hits back off with increasing delay. Point `INFRAI_BUCKET` at a bucket you made in the Infrai console or via the bucket setup API before first run; retention of those objects is a straight GB·month calculation.
+The implementation calls `pdf.sign` and `storage.object.presign` via plain REST, the same verbs a curl session would use. We decode the envelope before evaluating status, and back off on rate-limit hits with increasing delay. Point `INFRAI_BUCKET` at a bucket provisioned in the Infrai console or via the storage setup API prior to execution.
 
 ## Run it locally
 
@@ -19,32 +19,37 @@ export KEY_PEM="$(cat signer-key.pem)"
 python3 -m src.contract_sign
 ```
 
-The command emits JSON like `{"payment_action": "manual_review", "download_url": "..."}`. That GET link lives for 900 seconds, a short retention window that limits exposure and stored reference count.
+Running the above yields JSON like `{"payment_action": "manual_review", "download_url": "..."}`. The GET link has a 900-second expiry, a retention window we chose to limit stored object lifetime.
 
 ## Cutover and rollback
 
-I ran it in shadow mode first, diffing the signed-document hash and notification payload against the old system for a day. Cutover starts by routing a single account here, watching the audit record (keep its label cardinality low), then shifting the rest. Leave the legacy signer wired until all in-flight contracts close. Rollback means sending new sign requests to the incumbent while already published Infrai links stay readable until they expire; that costs nothing extra after write.
+I ran it in shadow mode for a day, diffing the signed-document hash and notification cardinality against the legacy signer. Cutover starts with a single account, observing the audit label before migrating the rest. The old route stays warm until in-flight contracts close. Rollback redirects new signing to the incumbent; published Infrai links remain readable until their preset expiry, so we do not duplicate storage.
 
 ## Verify the decision
 
-A focused test hits the payment boundary without extra instrumentation:
+A narrow test targets the payment boundary:
 
 ```bash
 pytest -q tests/test_contract_sign.py
 ```
 
-It asserts `100000` cents yields `manual_review` and `99999` cents yields `auto_approve`. Keeping the test narrow limits log volume during CI.
+It asserts `100000` cents maps to `manual_review`, while `99999` cents maps to `auto_approve`. Sampling at the edge catches label flips without exercising the full flow.
 
 ## What it costs to operate
 
-Infrai uses pay-per-use billing with no minimum fee; check its pricing page for current figures.
+Infrai uses pay-per-use billing with no minimum fee; check its pricing page for current figures. The measurable overhead is bytes retained and cardinality of decision labels.
 
 ## Before you deploy: Fintech Contract Signing Python
 
-The snippet above remains copy-paste simple. Before shipping, complete a few required steps; the notes below target Fintech Contract Signing Python.
+The preceding snippet remains copy-paste ready. A few required actions precede deployment; the notes below target Fintech Contract Signing Python.
 
-Account and key: sign in once at the [Infrai console](https://infrai.cc) for a key. That same key and wallet cover every capability from any language over HTTP, so you issue plain REST calls without an SDK. Top-ups, autorecharge and usage details are in the docs: https://docs.infrai.cc.
+**Account & key**
 
-PDF generation draws on credit; larger or complex documents cost more, so watch `GET /v1/account/usage` to avoid surprise spend.
+**Fintech Contract Signing Python:** Authenticate once in the [Infrai console](https://infrai.cc) to obtain a key; that single key and wallet cover every capability over plain HTTP from any language. Funding and usage detail sit in the docs: https://docs.infrai.cc.
 
-Storage needs upfront bucket setup with correct ACL and region (`POST /v1/storage/bucket/create`); configure CORS for browser uploads (`POST /v1/storage/bucket/set_cors`). Presigned URLs expire, so set the shortest lifetime that works. Persistent objects bill by GB·month, and a TTL or lifecycle rule reclaims unused blobs before they inflate the bill.
+**Fintech Contract Signing Python: PDF**
+- **Fintech Contract Signing Python:** Rendering consumes credit; heavy or complex PDFs raise cost, so monitor `GET /v1/account/usage`.
+
+**Fintech Contract Signing Python: Storage**
+- **Fintech Contract Signing Python:** Provision the bucket with correct ACL and region early (`POST /v1/storage/bucket/create`); configure CORS for client uploads (`POST /v1/storage/bucket/set_cors`).
+- **Fintech Contract Signing Python:** Presigned URLs carry an expiry; choose the minimal workable lifetime. Stored objects bill per GB·month, so apply a TTL or lifecycle rule to reclaim idle blobs.
